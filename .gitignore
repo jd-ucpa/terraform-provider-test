@@ -1,0 +1,7 @@
+.DS_Store
+.terraform
+terraform.plan
+.ignore
+*.zip
+.terraform.lock.hcl
+terraform.tfstate
