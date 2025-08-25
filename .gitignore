@@ -5,3 +5,5 @@ terraform.plan
 *.zip
 .terraform.lock.hcl
 terraform.tfstate
+test/test.env
+tfplugindocs

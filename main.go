@@ -1,16 +1,21 @@
 package main
 
 import (
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
-	"github.com/hashicorp/terraform-plugin-sdk/v2/plugin"
+	"context"
+	"log"
 
-	"github.com/jd-ucpa/terraform-provider-test/test"
+	"github.com/hashicorp/terraform-plugin-framework/providerserver"
+
+	"github.com/jd-ucpa/terraform-provider-test/internal"
 )
 
 func main() {
-	plugin.Serve(&plugin.ServeOpts{
-		ProviderFunc: func() *schema.Provider {
-			return test.Provider()
-		},
-	})
+	opts := providerserver.ServeOpts{
+		Address: "registry.terraform.io/jd-ucpa/test",
+	}
+
+	err := providerserver.Serve(context.Background(), internal.Provider, opts)
+	if err != nil {
+		log.Fatal(err.Error())
+	}
 }
