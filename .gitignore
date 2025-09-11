@@ -4,6 +4,8 @@ terraform.plan
 .ignore
 *.zip
 .terraform.lock.hcl
-terraform.tfstate
+*.tfstate*
 test/test.env
 tfplugindocs
+.cu*
+bin/terraform-provider-test

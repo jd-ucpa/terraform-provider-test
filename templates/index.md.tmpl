@@ -1,0 +1,13 @@
+---
+page_title: "Provider: {{.ProviderName}}"
+description: |-
+{{ .Description | plainmarkdown | trimspace | prefixlines "  " }}
+---
+
+# Test Provider
+
+Adds helpful resources for AWS.
+
+## Example Usage
+
+{{tffile "examples/provider/main.tf"}}

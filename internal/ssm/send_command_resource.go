@@ -73,8 +73,8 @@ func (r *SendCommandResource) Configure(ctx context.Context, req resource.Config
 	config, ok := req.ProviderData.(aws.Config)
 	if !ok {
 		resp.Diagnostics.AddError(
-			"Unexpected Resource Configure Type",
-			fmt.Sprintf("Expected *aws.Config, got: %T. Please report this issue to the provider developers.", req.ProviderData),
+			"Provider configuration error",
+			fmt.Sprintf("Expected aws.Config for SSM send command resource, got: %T. This indicates a provider configuration issue. Please verify your provider configuration and report this issue if it persists.", req.ProviderData),
 		)
 		return
 	}
@@ -252,6 +252,13 @@ func (r *SendCommandResource) Update(ctx context.Context, req resource.UpdateReq
 		if data.Status.IsUnknown() || data.Status.IsNull() {
 			data.Status = currentData.Status
 		}
+		// Préserver aussi les valeurs optionnelles de l'état actuel
+		if data.Comment.IsUnknown() || data.Comment.IsNull() {
+			data.Comment = currentData.Comment
+		}
+		if data.Parameters.IsUnknown() || data.Parameters.IsNull() {
+			data.Parameters = currentData.Parameters
+		}
 	}
 
 	// S'assurer que les valeurs calculées sont toujours définies
@@ -265,8 +272,10 @@ func (r *SendCommandResource) Update(ctx context.Context, req resource.UpdateReq
 		data.Status = types.StringValue("")
 	}
 
-	// Normaliser les valeurs optionnelles
-	r.normalizeOptionalValues(&data)
+	// Normaliser les valeurs optionnelles seulement si les triggers ont changé
+	if triggersChanged {
+		r.normalizeOptionalValues(&data)
+	}
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }
@@ -282,7 +291,7 @@ func (r *SendCommandResource) Delete(ctx context.Context, req resource.DeleteReq
 // - Vide : Commande terminée avec succès
 func PollCommandInvocation(ctx context.Context, client *ssm.Client, command *ssm.SendCommandOutput) diag.Diagnostics {
 	diagnostics := diag.Diagnostics{}
-	fmt.Printf("DEBUG: Polling command %s\n", *command.Command.CommandId)
+	// fmt.Printf("DEBUG: Polling command %s\n", *command.Command.CommandId)
 
 	// Récupérer les détails de la commande
 	listCommandInvocationsOutput, err := client.ListCommandInvocations(ctx, &ssm.ListCommandInvocationsInput{
@@ -290,12 +299,15 @@ func PollCommandInvocation(ctx context.Context, client *ssm.Client, command *ssm
 		Details:   true,
 	})
 	if err != nil {
-		diagnostics.AddError("AWS Client Error", fmt.Sprintf("Unable to ListCommandInvocations, got error: %s", err))
+		diagnostics.AddError(
+			"Unable to retrieve command invocations",
+			fmt.Sprintf("Error calling AWS SSM ListCommandInvocations API for command '%s': %s. Please verify your AWS credentials, permissions, and that the command exists.", *command.Command.CommandId, err),
+		)
 		return diagnostics
 	}
 
 	invocationCount := int32(len(listCommandInvocationsOutput.CommandInvocations))
-	fmt.Printf("DEBUG: Found %d invocations\n", invocationCount)
+	// fmt.Printf("DEBUG: Found %d invocations\n", invocationCount)
 	
 	if invocationCount == 0 {
 		// Continue polling as the command invocation is not yet available and the api is eventually consistent
@@ -308,7 +320,7 @@ func PollCommandInvocation(ctx context.Context, client *ssm.Client, command *ssm
 	hasErrors := false
 	
 	for _, invocation := range listCommandInvocationsOutput.CommandInvocations {
-		fmt.Printf("DEBUG: Invocation %s status: %s\n", *invocation.InstanceId, invocation.Status)
+		// fmt.Printf("DEBUG: Invocation %s status: %s\n", *invocation.InstanceId, invocation.Status)
 		
 		// Vérifier si la commande est encore en cours
 		if invocation.Status == ssmtypes.CommandInvocationStatusPending ||
@@ -324,12 +336,15 @@ func PollCommandInvocation(ctx context.Context, client *ssm.Client, command *ssm
 			invocation.Status == ssmtypes.CommandInvocationStatusTimedOut ||
 			invocation.Status == ssmtypes.CommandInvocationStatusCancelled {
 			hasErrors = true
-			diagnostics.AddError("Command Invocation Failed", fmt.Sprintf("Command invocation failed for instance %s: %s", *invocation.InstanceId, *invocation.StatusDetails))
+			diagnostics.AddError(
+				"Command invocation failed",
+				fmt.Sprintf("Command invocation failed for instance '%s': %s. Please check the instance status and SSM agent configuration.", *invocation.InstanceId, *invocation.StatusDetails),
+			)
 		}
 
 		// Vérifier les plugins pour détecter les erreurs
 		for _, plugin := range invocation.CommandPlugins {
-			fmt.Printf("DEBUG: Plugin %s status: %s\n", *plugin.Name, plugin.Status)
+			// fmt.Printf("DEBUG: Plugin %s status: %s\n", *plugin.Name, plugin.Status)
 			if plugin.Status == ssmtypes.CommandPluginStatusInProgress ||
 				plugin.Status == ssmtypes.CommandPluginStatusPending {
 				// Ces états indiquent que la commande est encore en cours
@@ -338,8 +353,8 @@ func PollCommandInvocation(ctx context.Context, client *ssm.Client, command *ssm
 				// Seuls les états autres que Success, InProgress, Pending, Delayed sont des erreurs
 				hasErrors = true
 				diagnostics.AddError(
-					fmt.Sprintf("Plugin %s failed: %s", *plugin.Name, *plugin.StatusDetails),
-					fmt.Sprintf("Command: %s, Instance: %s, Output: %s", *command.Command.CommandId, *invocation.InstanceId, *plugin.Output),
+					fmt.Sprintf("Plugin '%s' failed", *plugin.Name),
+					fmt.Sprintf("Plugin '%s' failed with status details: %s. Command: %s, Instance: %s, Output: %s. Please check the plugin configuration and target instance.", *plugin.Name, *plugin.StatusDetails, *command.Command.CommandId, *invocation.InstanceId, *plugin.Output),
 				)
 			}
 		}
@@ -347,18 +362,18 @@ func PollCommandInvocation(ctx context.Context, client *ssm.Client, command *ssm
 
 	// Si il y a des erreurs, retourner immédiatement
 	if hasErrors {
-		fmt.Printf("DEBUG: Command has errors, returning error diagnostics\n")
+		// fmt.Printf("DEBUG: Command has errors, returning error diagnostics\n")
 		return diagnostics
 	}
 
 	// Si toutes les invocations ne sont pas terminées, continuer le polling
 	if !allCompleted {
-		fmt.Printf("DEBUG: Command still in progress, returning warning diagnostics\n")
+		// fmt.Printf("DEBUG: Command still in progress, returning warning diagnostics\n")
 		return diagnostics
 	}
 
 	// Si on arrive ici, toutes les invocations sont terminées avec succès
-	fmt.Printf("DEBUG: All invocations completed successfully, returning empty diagnostics\n")
+	// fmt.Printf("DEBUG: All invocations completed successfully, returning empty diagnostics\n")
 	return diag.Diagnostics{} // Retourner des diagnostics vides pour indiquer le succès
 }
 
@@ -366,7 +381,7 @@ func PollCommandInvocation(ctx context.Context, client *ssm.Client, command *ssm
 // Cette fonction analyse les invocations de commande et leurs plugins pour déterminer
 // le statut final de la commande (Success, Failed, TimedOut, Cancelled, Unknown).
 func getActualCommandStatus(ctx context.Context, client *ssm.Client, command *ssm.SendCommandOutput) string {
-	fmt.Printf("DEBUG: Getting actual status for command %s\n", *command.Command.CommandId)
+	// fmt.Printf("DEBUG: Getting actual status for command %s\n", *command.Command.CommandId)
 	
 	// Récupérer les détails de la commande
 	listCommandInvocationsOutput, err := client.ListCommandInvocations(ctx, &ssm.ListCommandInvocationsInput{
@@ -374,21 +389,21 @@ func getActualCommandStatus(ctx context.Context, client *ssm.Client, command *ss
 		Details:   true,
 	})
 	if err != nil {
-		fmt.Printf("DEBUG: Error getting command invocations: %s\n", err)
+		// fmt.Printf("DEBUG: Error getting command invocations: %s\n", err)
 		return "Unknown"
 	}
 
-	fmt.Printf("DEBUG: Found %d command invocations\n", len(listCommandInvocationsOutput.CommandInvocations))
+	// fmt.Printf("DEBUG: Found %d command invocations\n", len(listCommandInvocationsOutput.CommandInvocations))
 	
 	// Vérifier le statut de chaque invocation
 	for _, invocation := range listCommandInvocationsOutput.CommandInvocations {
-		fmt.Printf("DEBUG: Invocation status: %s\n", invocation.Status)
+		// fmt.Printf("DEBUG: Invocation status: %s\n", invocation.Status)
 		
 		// Vérifier les plugins pour détecter les erreurs
 		for _, plugin := range invocation.CommandPlugins {
-			fmt.Printf("DEBUG: Plugin %s status: %s\n", *plugin.Name, plugin.Status)
+			// fmt.Printf("DEBUG: Plugin %s status: %s\n", *plugin.Name, plugin.Status)
 			if plugin.Status != ssmtypes.CommandPluginStatusSuccess {
-				fmt.Printf("DEBUG: Plugin failed, returning Failed\n")
+				// fmt.Printf("DEBUG: Plugin failed, returning Failed\n")
 				return "Failed"
 			}
 		}
@@ -396,24 +411,24 @@ func getActualCommandStatus(ctx context.Context, client *ssm.Client, command *ss
 		// Vérifier le statut de l'invocation
 		switch invocation.Status {
 		case ssmtypes.CommandInvocationStatusSuccess:
-			fmt.Printf("DEBUG: Invocation success, returning Success\n")
+			// fmt.Printf("DEBUG: Invocation success, returning Success\n")
 			return "Success"
 		case ssmtypes.CommandInvocationStatusFailed:
-			fmt.Printf("DEBUG: Invocation failed, returning Failed\n")
+			// fmt.Printf("DEBUG: Invocation failed, returning Failed\n")
 			return "Failed"
 		case ssmtypes.CommandInvocationStatusTimedOut:
-			fmt.Printf("DEBUG: Invocation timed out, returning TimedOut\n")
+			// fmt.Printf("DEBUG: Invocation timed out, returning TimedOut\n")
 			return "TimedOut"
 		case ssmtypes.CommandInvocationStatusCancelled:
-			fmt.Printf("DEBUG: Invocation cancelled, returning Cancelled\n")
+			// fmt.Printf("DEBUG: Invocation cancelled, returning Cancelled\n")
 			return "Cancelled"
 		default:
-			fmt.Printf("DEBUG: Unknown invocation status, returning Unknown\n")
+			// fmt.Printf("DEBUG: Unknown invocation status, returning Unknown\n")
 			return "Unknown"
 		}
 	}
 
-	fmt.Printf("DEBUG: No invocations found, returning Unknown\n")
+	// fmt.Printf("DEBUG: No invocations found, returning Unknown\n")
 	return "Unknown"
 }
 
@@ -426,12 +441,18 @@ func (r *SendCommandResource) validateAndBuildTargets(ctx context.Context, data 
 	hasTargets := len(data.Targets) > 0
 	
 	if !hasInstanceIds && !hasTargets {
-		diagnostics.AddError("Validation Error", "Either instance_ids or targets must be specified")
+		diagnostics.AddError(
+			"Invalid target configuration",
+			"Either instance_ids or targets must be specified. Please provide at least one target for the SSM command.",
+		)
 		return nil, diagnostics
 	}
 	
 	if hasInstanceIds && hasTargets {
-		diagnostics.AddError("Validation Error", "Cannot specify both instance_ids and targets. Use either instance_ids or targets, not both")
+		diagnostics.AddError(
+			"Conflicting target configuration",
+			"Cannot specify both instance_ids and targets. Use either instance_ids or targets, not both. Please choose one targeting method.",
+		)
 		return nil, diagnostics
 	}
 
@@ -477,7 +498,10 @@ func (r *SendCommandResource) convertParameters(ctx context.Context, data SendCo
 		unparsed := make(map[string]string)
 		err := data.Parameters.ElementsAs(ctx, &unparsed, false)
 		if err != nil {
-			diagnostics.AddError("Client Error", fmt.Sprintf("Unable to convert parameters, got error: %s", err))
+			diagnostics.AddError(
+				"Unable to parse parameters",
+				fmt.Sprintf("Error converting parameters to map: %s. Please verify the parameters format is valid.", err),
+			)
 			return nil, diagnostics
 		}
 		for k, v := range unparsed {
@@ -500,7 +524,10 @@ func (r *SendCommandResource) executeSSMCommand(ctx context.Context, data SendCo
 		Comment:      data.Comment.ValueStringPointer(),
 	})
 	if err != nil {
-		diagnostics.AddError("Client Error", fmt.Sprintf("Unable to send command, got error: %s", err))
+		diagnostics.AddError(
+			"Unable to send SSM command",
+			fmt.Sprintf("Error calling AWS SSM SendCommand API: %s. Please verify your AWS credentials, permissions, and that the target instances are accessible via SSM.", err),
+		)
 		return data, diagnostics
 	}
 
@@ -517,7 +544,10 @@ func (r *SendCommandResource) executeSSMCommand(ctx context.Context, data SendCo
 	maxAttempts := 10 // Limiter le nombre de tentatives
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if ctx.Err() != nil {
-			diagnostics.AddError("Operation Cancelled", fmt.Sprintf("Context cancelled before attempt %d: %s", attempt+1, ctx.Err()))
+			diagnostics.AddError(
+				"Operation cancelled",
+				fmt.Sprintf("Context cancelled before attempt %d: %s. The operation was interrupted before completion.", attempt+1, ctx.Err()),
+			)
 			return data, diagnostics
 		}
 
@@ -526,7 +556,7 @@ func (r *SendCommandResource) executeSSMCommand(ctx context.Context, data SendCo
 		if attemptDiag.HasError() {
 			// La commande SSM a échoué, mais on ne fait pas échouer terraform apply
 			// On met juste le statut à "Failed" et on continue
-			fmt.Printf("DEBUG: SSM command failed, setting status to Failed\n")
+			// fmt.Printf("DEBUG: SSM command failed, setting status to Failed\n")
 			data.Status = types.StringValue("Failed")
 			return data, diagnostics
 		} else if attemptDiag.WarningsCount() > 0 {
@@ -541,39 +571,45 @@ func (r *SendCommandResource) executeSSMCommand(ctx context.Context, data SendCo
 				continue
 			case <-ctx.Done():
 				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-					diagnostics.AddError("Timeout while waiting for SSM Command to complete", fmt.Sprintf("Timeout occurred while waiting on command %s (polled %d times over %s)", *command.Command.CommandId, attempt+1, createTimeout))
+					diagnostics.AddError(
+						"Timeout while waiting for SSM command to complete",
+						fmt.Sprintf("Timeout occurred while waiting on command '%s' (polled %d times over %s). The command may still be running on the target instances.", *command.Command.CommandId, attempt+1, createTimeout),
+					)
 					return data, diagnostics
 				} else {
-					diagnostics.AddError("Operation Cancelled", fmt.Sprintf("Context cancelled before attempt %d: %s", attempt+1, ctx.Err()))
+					diagnostics.AddError(
+						"Operation cancelled",
+						fmt.Sprintf("Context cancelled before attempt %d: %s. The operation was interrupted before completion.", attempt+1, ctx.Err()),
+					)
 					return data, diagnostics
 				}
 			}
 		} else {
 			// Command completed - get the actual status from AWS
-			fmt.Printf("DEBUG: Polling completed, getting actual status\n")
+			// fmt.Printf("DEBUG: Polling completed, getting actual status\n")
 			actualStatus := getActualCommandStatus(ctx, r.ssm, command)
-			fmt.Printf("DEBUG: Actual status: %s\n", actualStatus)
+			// fmt.Printf("DEBUG: Actual status: %s\n", actualStatus)
 			data.Status = types.StringValue(actualStatus)
 			return data, diagnostics
 		}
 	}
 	
 	// Si on arrive ici, on a dépassé le nombre max de tentatives
-	fmt.Printf("DEBUG: Max attempts reached, getting final status\n")
+	// fmt.Printf("DEBUG: Max attempts reached, getting final status\n")
 	actualStatus := getActualCommandStatus(ctx, r.ssm, command)
-	fmt.Printf("DEBUG: Final status: %s\n", actualStatus)
+	// fmt.Printf("DEBUG: Final status: %s\n", actualStatus)
 	data.Status = types.StringValue(actualStatus)
 	return data, diagnostics
 }
 
 // normalizeOptionalValues s'assure que les valeurs optionnelles sont définies
 func (r *SendCommandResource) normalizeOptionalValues(data *SendCommandResourceModel) {
+	// Ne pas forcer les valeurs null à devenir des chaînes vides
+	// Cela préserve la cohérence avec l'état Terraform
 	if data.Parameters.IsNull() {
 		data.Parameters = types.MapNull(types.StringType)
 	}
-	if data.Comment.IsNull() {
-		data.Comment = types.StringValue("")
-	}
+	// Comment peut rester null si c'est le cas
 	if data.Triggers.IsNull() {
 		data.Triggers = types.MapNull(types.StringType)
 	}

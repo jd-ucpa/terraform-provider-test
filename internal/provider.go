@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
 	"regexp"
 	"strings"
@@ -17,9 +18,21 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
+	"github.com/jd-ucpa/terraform-provider-test/internal/cloudwatch"
+	"github.com/jd-ucpa/terraform-provider-test/internal/codebuild"
+	"github.com/jd-ucpa/terraform-provider-test/internal/dynamodb"
+	"github.com/jd-ucpa/terraform-provider-test/internal/functions"
+	"github.com/jd-ucpa/terraform-provider-test/internal/sfn"
 	"github.com/jd-ucpa/terraform-provider-test/internal/ssm"
-	"github.com/jd-ucpa/terraform-provider-test/internal/sts"
 )
+
+//go:embed VERSION
+var version string
+
+// Version returns the version of terraform-provider-test.
+func Version() string {
+	return strings.TrimSpace(version)
+}
 
 // Ensure TestProvider satisfies various provider interfaces.
 var _ provider.Provider = &TestProvider{}
@@ -28,23 +41,6 @@ var _ provider.ProviderWithFunctions = &TestProvider{}
 // TestProvider est le provider Terraform principal qui gère l'authentification AWS
 // et enregistre les ressources et data sources disponibles.
 type TestProvider struct{}
-
-// validRegions contient la liste des régions AWS valides supportées par ce provider.
-// Cette liste est utilisée pour valider la région spécifiée dans la configuration.
-var validRegions = []string{
-	"us-east-1", // US East – Virginie du Nord
-	"us-east-2", // US East – Ohio
-	"us-west-1", // US West – Californie du Nord
-	"us-west-2", // US West – Oregon
-	"eu-west-1",  // Irlande
-	"eu-west-2",  // Royaume‑Uni – Londres
-	"eu-west-3",  // France – Paris
-	"eu-central-1", // Allemagne – Francfort
-	"eu-central-2", // Suisse – Zurich – opt‑in
-	"eu-north-1",   // Suède – Stockholm
-	"eu-south-1",   // Italie – Milan – opt‑in
-	"eu-south-2",   // Espagne – Aragon – opt‑in
-}
 
 // TestProviderModel définit le modèle de configuration du provider.
 // Il contient les paramètres globaux comme la région, le profil et la configuration assume_role.
@@ -65,7 +61,7 @@ type AssumeRoleModel struct {
 // Ce nom est utilisé pour référencer ce provider dans les fichiers .tf.
 func (p *TestProvider) Metadata(ctx context.Context, req provider.MetadataRequest, resp *provider.MetadataResponse) {
 	resp.TypeName = "test"
-	resp.Version = "0.0.2"
+	resp.Version = Version()
 }
 
 // Schema définit la structure et la documentation du provider.
@@ -126,9 +122,15 @@ func (p *TestProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 	if err != nil {
 		// Vérifier si l'erreur est liée à un profil inexistant
 		if strings.Contains(err.Error(), "failed to get shared config profile") {
-			resp.Diagnostics.AddError("failed to get shared config profile", err.Error())
+			resp.Diagnostics.AddError(
+				"Failed to load AWS profile",
+				fmt.Sprintf("Unable to load AWS profile: %s. Please verify that the AWS profile exists and is properly configured in your AWS credentials file.", err.Error()),
+			)
 		} else {
-			resp.Diagnostics.AddError("AWS Configuration Error", fmt.Sprintf("Unable to load AWS config: %s", err))
+			resp.Diagnostics.AddError(
+				"Unable to load AWS configuration",
+				fmt.Sprintf("Error loading AWS configuration: %s. Please verify your AWS credentials are properly configured (via AWS CLI, environment variables, or IAM roles).", err),
+			)
 		}
 		return
 	}
@@ -140,8 +142,8 @@ func (p *TestProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 		// Valider la région
 		if !isValidRegion(region) {
 			resp.Diagnostics.AddError(
+				"Invalid AWS region configuration",
 				fmt.Sprintf("invalid AWS Region: %s", region),
-				"",
 			)
 			return
 		}
@@ -156,8 +158,10 @@ func (p *TestProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 		// Charger la configuration AWS avec le profil spécifié
 		cfg, err = awsconfig.LoadDefaultConfig(ctx, awsconfig.WithSharedConfigProfile(profile))
 		if err != nil {
-			resp.Diagnostics.AddError("failed to get shared config profile: "+profile, "")
-      // resp.Diagnostics.AddError("failed to get shared config profile", err.Error())
+			resp.Diagnostics.AddError(
+				"Failed to load AWS profile",
+				fmt.Sprintf("Unable to load AWS profile '%s': %s. Please verify that the profile exists in your AWS credentials file (~/.aws/credentials) and is properly configured.", profile, err.Error()),
+			)
 			return
 		}
 		
@@ -174,8 +178,8 @@ func (p *TestProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 		// Valider le format de l'ARN
 		if !isValidRoleARN(roleArn) {
 			resp.Diagnostics.AddError(
-				fmt.Sprintf(`"assume_role.0.role_arn" (%s) is an invalid ARN: invalid account ID value (expecting to match regular expression: ^(aws|aws-managed|third-party|aws-marketplace|\\d{12}|cw.{10})$)`, roleArn),
-				"",
+				"Invalid IAM role ARN configuration",
+				fmt.Sprintf(`"assume_role.0.role_arn" (%s) is an invalid ARN: invalid account ID value`, roleArn),
 			)
 			return
 		}
@@ -198,9 +202,18 @@ func (p *TestProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 			options.RoleSessionName = sessionName
 		})
 		
-
-		
+		// Créer le provider d'assume role
 		cfg.Credentials = stscreds.NewAssumeRoleProvider(stsClient, config.AssumeRole.RoleArn.ValueString(), assumeRoleOptions...)
+		
+		// Tester l'assume role pour s'assurer qu'il fonctionne
+		_, err = cfg.Credentials.Retrieve(ctx)
+		if err != nil {
+			resp.Diagnostics.AddError(
+				"Unable to assume IAM role",
+				fmt.Sprintf("Error assuming IAM role '%s': %s. Please verify that the role exists, you have permission to assume it, and that your current credentials are valid.", roleArn, err),
+			)
+			return
+		}
 	}
 
 	// Partager la configuration AWS avec les ressources
@@ -213,7 +226,11 @@ func (p *TestProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 // disponibles dans les configurations Terraform.
 func (p *TestProvider) Resources(ctx context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
+		codebuild.NewStartBuildResource,
+		sfn.NewStartSyncExecutionResource,
 		ssm.NewSendCommandResource,
+		ssm.NewSendFilesResource,
+		ssm.NewActivationResource,
 	}
 }
 
@@ -222,7 +239,13 @@ func (p *TestProvider) Resources(ctx context.Context) []func() resource.Resource
 // disponibles dans les configurations Terraform.
 func (p *TestProvider) DataSources(ctx context.Context) []func() datasource.DataSource {
 	return []func() datasource.DataSource{
-		sts.NewCallerIdentityDataSource,
+		cloudwatch.NewCloudWatchAlarmsDataSource,
+		cloudwatch.NewCloudWatchMetricsDataSource,
+		dynamodb.NewScanDataSource,
+		functions.NewTimestampDataSource,
+		functions.NewJSONPrettyDataSource,
+		ssm.NewActivationDataSource,
+		ssm.NewActivationsDataSource,
 	}
 }
 
@@ -230,7 +253,9 @@ func (p *TestProvider) DataSources(ctx context.Context) []func() datasource.Data
 // Cette méthode retourne une liste de constructeurs de fonctions qui seront
 // disponibles dans les configurations Terraform.
 func (p *TestProvider) Functions(ctx context.Context) []func() function.Function {
-	return []func() function.Function{}
+	return []func() function.Function{
+		// No functions currently available
+	}
 }
 
 // Provider crée et retourne une nouvelle instance du provider TestProvider.
@@ -239,12 +264,45 @@ func Provider() provider.Provider {
 	return &TestProvider{}
 }
 
-// isValidRegion vérifie si une région AWS est valide en la comparant avec la liste
-// des régions supportées. Cette fonction est utilisée pour valider la configuration
-// du provider.
+// validRegionPrefixes contient la liste des préfixes de régions AWS valides.
+// Une région AWS valide commence par un de ces préfixes et se termine par un nombre.
+var validRegionPrefixes = []string{
+	"af-south-",
+	"ap-east-",
+	"ap-northeast-",
+	"ap-south-",
+	"ap-southeast-",
+	"ca-central-",
+	"ca-west-",
+	"cn-north-",
+	"cn-northwest-",
+	"eu-central-",
+	"eu-north-",
+	"eu-south-",
+	"eu-west-",
+	"il-central-",
+	"me-central-",
+	"me-south-",
+	"mx-central-",
+	"sa-east-",
+	"us-east-",
+	"us-gov-east-",
+	"us-gov-west-",
+	"us-west-",
+}
+
+// isValidRegion vérifie si une région AWS est valide en testant si elle commence
+// par un préfixe valide et se termine par un nombre. Cette fonction est utilisée
+// pour valider la configuration du provider.
 func isValidRegion(region string) bool {
-	for _, validRegion := range validRegions {
-		if strings.EqualFold(region, validRegion) {
+	// Vérifier si la région se termine par un nombre
+	if !regexp.MustCompile(`\d+$`).MatchString(region) {
+		return false
+	}
+	
+	// Vérifier si la région commence par un préfixe valide
+	for _, prefix := range validRegionPrefixes {
+		if strings.HasPrefix(strings.ToLower(region), prefix) {
 			return true
 		}
 	}
